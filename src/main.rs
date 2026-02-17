@@ -6,7 +6,7 @@ use std::env;
 use std::ffi::{CStr, CString};
 use std::io::{self, BufRead, Write};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use nix::libc;
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
@@ -16,6 +16,9 @@ use nix::unistd::{self, ForkResult, Pid};
 
 // Constants
 const MAXJOBS: usize = 16;
+
+// Global foreground PID for signal handlers
+static FG_PID: AtomicI32 = AtomicI32::new(0);
 
 /// Job states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,83 +169,67 @@ impl ShellState {
     }
 }
 
-// Atomic flags for signal communication
-static GOT_SIGCHLD: AtomicBool = AtomicBool::new(false);
-static GOT_SIGINT: AtomicBool = AtomicBool::new(false);
-static GOT_SIGTSTP: AtomicBool = AtomicBool::new(false);
-
 /// Async-signal-safe write to stdout
 fn sio_puts(s: &str) {
     let _ = unistd::write(io::stdout(), s.as_bytes());
 }
 
-/// Signal handler for SIGCHLD
-extern "C" fn sigchld_handler(_: libc::c_int) {
-    GOT_SIGCHLD.store(true, Ordering::SeqCst);
-}
-
-/// Signal handler for SIGINT
+/// Signal handler for SIGINT - forward to foreground process
 extern "C" fn sigint_handler(_: libc::c_int) {
-    GOT_SIGINT.store(true, Ordering::SeqCst);
+    let fg = FG_PID.load(Ordering::SeqCst);
+    if fg > 0 {
+        unsafe {
+            libc::kill(fg, libc::SIGINT);
+        }
+    }
 }
 
-/// Signal handler for SIGTSTP
+/// Signal handler for SIGTSTP - forward to foreground process
 extern "C" fn sigtstp_handler(_: libc::c_int) {
-    GOT_SIGTSTP.store(true, Ordering::SeqCst);
+    let fg = FG_PID.load(Ordering::SeqCst);
+    if fg > 0 {
+        // Send SIGSTOP instead of SIGTSTP - SIGTSTP can be ignored but SIGSTOP cannot
+        unsafe {
+            libc::kill(fg, libc::SIGSTOP);
+        }
+    }
+}
+
+/// Signal handler for SIGCHLD - just let waitpid handle it
+extern "C" fn sigchld_handler(_: libc::c_int) {
+    // Do nothing - waitpid in the main loop will handle reaping
 }
 
 /// Signal handler for SIGQUIT
 extern "C" fn sigquit_handler(_: libc::c_int) {
     sio_puts("Terminating after receipt of SIGQUIT signal\n");
-    std::process::exit(1);
+    unsafe { libc::_exit(1) };
 }
 
-/// Process any pending signals
-fn process_signals(state: &mut ShellState) {
-    // Handle SIGCHLD
-    if GOT_SIGCHLD.swap(false, Ordering::SeqCst) {
-        // Reap all available zombie children
-        loop {
-            match wait::waitpid(
-                Pid::from_raw(-1),
-                Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
-            ) {
-                Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
-                    if let Some(job) = state.get_job_by_pid(pid) {
-                        if job.state == JobState::Background {
-                            state.delete_job(pid);
-                        }
+/// Reap any zombie background processes
+fn reap_children(state: &mut ShellState) {
+    loop {
+        match wait::waitpid(
+            Pid::from_raw(-1),
+            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
+        ) {
+            Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
+                // Only delete background jobs here; foreground is handled in wait_fg
+                if let Some(job) = state.get_job_by_pid(pid) {
+                    if job.state == JobState::Background {
+                        state.delete_job(pid);
                     }
                 }
-                Ok(WaitStatus::StillAlive) | Err(_) => break,
-                _ => {}
             }
-        }
-    }
-
-    // Handle SIGINT
-    if GOT_SIGINT.swap(false, Ordering::SeqCst) {
-        if let Some(fg_pid) = state.fg_pid() {
-            state.delete_job(fg_pid);
-            let _ = signal::kill(fg_pid, Signal::SIGINT);
-        } else {
-            println!("No running foreground job to quit");
-            std::process::exit(0);
-        }
-    }
-
-    // Handle SIGTSTP
-    if GOT_SIGTSTP.swap(false, Ordering::SeqCst) {
-        if let Some(fg_pid) = state.fg_pid() {
-            if let Some(job) = state.get_job_by_pid_mut(fg_pid) {
-                let jid = job.jid;
-                job.state = JobState::Stopped;
-                println!("Job [{}] ({}) stopped by signal SIGTSTP", jid, fg_pid);
+            Ok(WaitStatus::Stopped(pid, _)) => {
+                // Background job was stopped
+                if let Some(job) = state.get_job_by_pid_mut(pid) {
+                    if job.state == JobState::Background {
+                        job.state = JobState::Stopped;
+                    }
+                }
             }
-            // Send SIGSTOP because SIGTSTP doesn't always work
-            let _ = signal::kill(fg_pid, Signal::SIGSTOP);
-        } else {
-            println!("No running foreground job to stop");
+            _ => break,
         }
     }
 }
@@ -369,14 +356,12 @@ fn do_bgfg(state: &mut ShellState, args: &[String]) {
     }
 
     let pid = job.pid;
-    let new_state = if is_fg {
+    job.state = if is_fg {
         JobState::Foreground
     } else {
         JobState::Background
     };
-    job.state = new_state;
 
-    println!("Continuing {}: {:?}", pid, new_state);
     let _ = signal::kill(pid, Signal::SIGCONT);
 
     if is_fg {
@@ -384,17 +369,41 @@ fn do_bgfg(state: &mut ShellState, args: &[String]) {
     }
 }
 
-/// Wait for a foreground job to complete
+/// Wait for a foreground job to complete or stop
 fn wait_fg(state: &mut ShellState, pid: Pid) {
-    // Block until process exits, stops, or continues
-    let _ = wait::waitpid(pid, Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED));
+    // Set the global FG_PID so signal handlers know where to forward
+    FG_PID.store(pid.as_raw(), Ordering::SeqCst);
 
-    // If it exited and job is still foreground, delete it
-    if let Some(job) = state.get_job_by_pid(pid) {
-        if job.state == JobState::Foreground {
-            state.delete_job(pid);
+    loop {
+        match wait::waitpid(pid, Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED)) {
+            Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
+                // Process exited or was killed
+                state.delete_job(pid);
+                break;
+            }
+            Ok(WaitStatus::Stopped(_, _)) => {
+                // Process was stopped (Ctrl-Z)
+                if let Some(job) = state.get_job_by_pid_mut(pid) {
+                    let jid = job.jid;
+                    job.state = JobState::Stopped;
+                    println!("Job [{}] ({}) stopped by signal SIGTSTP", jid, pid);
+                }
+                break;
+            }
+            Ok(WaitStatus::Continued(_)) => {
+                // Process continued, keep waiting
+                continue;
+            }
+            Err(_) => {
+                // Error or no child
+                break;
+            }
+            _ => continue,
         }
     }
+
+    // Clear the foreground PID
+    FG_PID.store(0, Ordering::SeqCst);
 }
 
 /// Evaluate and execute a command line
@@ -417,7 +426,7 @@ fn eval(state: &mut ShellState, cmdline: &str, path_str: &str) {
         match find_executable(&args[0], path_str) {
             Some(path) => path,
             None => {
-                println!("Executable {} not found!", args[0]);
+                println!("{}: command not found", args[0]);
                 return;
             }
         }
@@ -427,8 +436,15 @@ fn eval(state: &mut ShellState, cmdline: &str, path_str: &str) {
     match unsafe { unistd::fork() } {
         Ok(ForkResult::Child) => {
             // Child process
-            // Set process group to the child's PID
+            // Set process group to the child's PID so signals go to the right place
             let _ = unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0));
+
+            // Reset signal handlers to default in child
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+            }
 
             // Convert args to CStrings
             let c_path = CString::new(cmd_path.as_str()).unwrap();
@@ -438,10 +454,10 @@ fn eval(state: &mut ShellState, cmdline: &str, path_str: &str) {
                 .collect();
             let c_args_refs: Vec<&CStr> = c_args.iter().map(|s| s.as_c_str()).collect();
 
-            // Execute
-            let _ = unistd::execv(&c_path, &c_args_refs);
-            eprintln!("execv failed for {}", cmd_path);
-            std::process::exit(1);
+            // Execute with environment
+            let _ = unistd::execvp(&c_path, &c_args_refs);
+            eprintln!("{}: command not found", args[0]);
+            std::process::exit(127);
         }
         Ok(ForkResult::Parent { child }) => {
             // Parent process
@@ -452,7 +468,11 @@ fn eval(state: &mut ShellState, cmdline: &str, path_str: &str) {
             };
             state.add_job(child, job_state, cmdline);
 
-            if !is_bg {
+            if is_bg {
+                if let Some(job) = state.get_job_by_pid(child) {
+                    println!("[{}] {}", job.jid, child);
+                }
+            } else {
                 wait_fg(state, child);
             }
         }
@@ -552,8 +572,8 @@ fn main() {
     let mut stdout = io::stdout();
 
     loop {
-        // Process any pending signals
-        process_signals(&mut state);
+        // Reap any zombie background processes
+        reap_children(&mut state);
 
         // Print prompt
         if emit_prompt {
