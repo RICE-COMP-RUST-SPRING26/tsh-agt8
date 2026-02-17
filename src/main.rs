@@ -386,49 +386,13 @@ fn do_bgfg(state: &mut ShellState, args: &[String]) {
 
 /// Wait for a foreground job to complete
 fn wait_fg(state: &mut ShellState, pid: Pid) {
-    println!("Waiting {}", pid);
+    // Block until process exits, stops, or continues
+    let _ = wait::waitpid(pid, Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED));
 
-    loop {
-        // Process any pending signals first
-        process_signals(state);
-
-        // Check if the job is still in foreground state
-        match state.get_job_by_pid(pid) {
-            Some(job) if job.state == JobState::Foreground => {}
-            Some(_) => {
-                // Job was stopped or moved to background
-                println!("Done waiting {}", pid);
-                return;
-            }
-            None => {
-                // Job was deleted (terminated)
-                println!("Done waiting {}", pid);
-                return;
-            }
-        }
-
-        // Wait for the specific process
-        match wait::waitpid(
-            pid,
-            Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED | WaitPidFlag::WNOHANG),
-        ) {
-            Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
-                state.delete_job(pid);
-                println!("Done waiting {}", pid);
-                return;
-            }
-            Ok(WaitStatus::Stopped(_, _)) => {
-                // Process was stopped, it should have been handled by signal handler
-                println!("Done waiting {}", pid);
-                return;
-            }
-            Ok(WaitStatus::StillAlive) => {
-                // Process still running, sleep briefly and try again
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            _ => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+    // If it exited and job is still foreground, delete it
+    if let Some(job) = state.get_job_by_pid(pid) {
+        if job.state == JobState::Foreground {
+            state.delete_job(pid);
         }
     }
 }
@@ -554,7 +518,6 @@ fn main() {
     for arg in args.iter().skip(1) {
         if arg.starts_with('-') {
             for c in arg.chars().skip(1) {
-                println!("{}", c as i32);
                 match c {
                     'h' => print_usage(),
                     'v' => verbose = true,
