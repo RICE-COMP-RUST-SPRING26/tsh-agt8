@@ -9,7 +9,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use nix::libc;
-use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal};
 use nix::sys::stat;
 use nix::sys::wait::{self, WaitPidFlag, WaitStatus};
 use nix::unistd::{self, ForkResult, Pid};
@@ -174,6 +174,30 @@ fn sio_puts(s: &str) {
     let _ = unistd::write(io::stdout(), s.as_bytes());
 }
 
+/// Create a signal mask containing signals that modify shared state
+fn block_mask() -> SigSet {
+    let mut mask = SigSet::empty();
+    mask.add(Signal::SIGCHLD);
+    mask.add(Signal::SIGINT);
+    mask.add(Signal::SIGTSTP);
+    mask
+}
+
+/// Block signals and return the old mask for later restoration
+fn block_signals() -> SigSet {
+    let mask = block_mask();
+    let mut old_mask = SigSet::empty();
+    signal::sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), Some(&mut old_mask))
+        .expect("sigprocmask block failed");
+    old_mask
+}
+
+/// Restore the previous signal mask
+fn restore_signals(old_mask: &SigSet) {
+    signal::sigprocmask(SigmaskHow::SIG_SETMASK, Some(old_mask), None)
+        .expect("sigprocmask restore failed");
+}
+
 /// Signal handler for SIGINT - forward to foreground process
 extern "C" fn sigint_handler(_: libc::c_int) {
     let fg = FG_PID.load(Ordering::SeqCst);
@@ -208,6 +232,9 @@ extern "C" fn sigquit_handler(_: libc::c_int) {
 
 /// Reap any zombie background processes
 fn reap_children(state: &mut ShellState) {
+    // Block signals while modifying job list
+    let old_mask = block_signals();
+
     loop {
         match wait::waitpid(
             Pid::from_raw(-1),
@@ -232,6 +259,8 @@ fn reap_children(state: &mut ShellState) {
             _ => break,
         }
     }
+
+    restore_signals(&old_mask);
 }
 
 /// Find an executable in the PATH
@@ -304,7 +333,9 @@ fn builtin_cmd(state: &mut ShellState, args: &[String]) -> bool {
     match args[0].as_str() {
         "quit" => std::process::exit(0),
         "jobs" => {
+            let old_mask = block_signals();
             state.list_jobs();
+            restore_signals(&old_mask);
             true
         }
         "bg" | "fg" => {
@@ -324,12 +355,16 @@ fn do_bgfg(state: &mut ShellState, args: &[String]) {
         return;
     }
 
+    // Block signals while modifying job state
+    let old_mask = block_signals();
+
     let job = if args[1].starts_with('%') {
         // Job ID
         let jid_str = &args[1][1..];
         match jid_str.parse::<i32>() {
             Ok(jid) if jid > 0 => state.get_job_by_jid_mut(jid),
             _ => {
+                restore_signals(&old_mask);
                 println!("Job id must be a positive integer");
                 return;
             }
@@ -339,6 +374,7 @@ fn do_bgfg(state: &mut ShellState, args: &[String]) {
         match args[1].parse::<i32>() {
             Ok(pid) if pid > 0 => state.get_job_by_pid_mut(Pid::from_raw(pid)),
             _ => {
+                restore_signals(&old_mask);
                 println!("Pid must be a positive integer");
                 return;
             }
@@ -346,12 +382,15 @@ fn do_bgfg(state: &mut ShellState, args: &[String]) {
     };
 
     let Some(job) = job else {
+        restore_signals(&old_mask);
         println!("No such job");
         return;
     };
 
     if job.state != JobState::Stopped {
-        println!("Job {} is not stopped", job.jid);
+        let jid = job.jid;
+        restore_signals(&old_mask);
+        println!("Job {} is not stopped", jid);
         return;
     }
 
@@ -361,6 +400,8 @@ fn do_bgfg(state: &mut ShellState, args: &[String]) {
     } else {
         JobState::Background
     };
+
+    restore_signals(&old_mask);
 
     let _ = signal::kill(pid, Signal::SIGCONT);
 
@@ -378,16 +419,20 @@ fn wait_fg(state: &mut ShellState, pid: Pid) {
         match wait::waitpid(pid, Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED)) {
             Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
                 // Process exited or was killed
+                let old_mask = block_signals();
                 state.delete_job(pid);
+                restore_signals(&old_mask);
                 break;
             }
             Ok(WaitStatus::Stopped(_, _)) => {
                 // Process was stopped (Ctrl-Z)
+                let old_mask = block_signals();
                 if let Some(job) = state.get_job_by_pid_mut(pid) {
                     let jid = job.jid;
                     job.state = JobState::Stopped;
                     println!("Job [{}] ({}) stopped by signal SIGTSTP", jid, pid);
                 }
+                restore_signals(&old_mask);
                 break;
             }
             Ok(WaitStatus::Continued(_)) => {
@@ -432,10 +477,17 @@ fn eval(state: &mut ShellState, cmdline: &str, path_str: &str) {
         }
     };
 
+    // Block signals before fork to prevent race condition where child exits
+    // before parent adds job to job list
+    let old_mask = block_signals();
+
     // Fork and execute
     match unsafe { unistd::fork() } {
         Ok(ForkResult::Child) => {
             // Child process
+            // Unblock signals in child
+            restore_signals(&old_mask);
+
             // Set process group to the child's PID so signals go to the right place
             let _ = unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0));
 
@@ -468,6 +520,9 @@ fn eval(state: &mut ShellState, cmdline: &str, path_str: &str) {
             };
             state.add_job(child, job_state, cmdline);
 
+            // Unblock signals after adding job
+            restore_signals(&old_mask);
+
             if is_bg {
                 if let Some(job) = state.get_job_by_pid(child) {
                     println!("[{}] {}", job.jid, child);
@@ -477,6 +532,7 @@ fn eval(state: &mut ShellState, cmdline: &str, path_str: &str) {
             }
         }
         Err(e) => {
+            restore_signals(&old_mask);
             eprintln!("fork failed: {}", e);
         }
     }
